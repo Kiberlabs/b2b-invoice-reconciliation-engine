@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "b2b-invoice-reconciliation-engine"
+version = "0.1.0"
+description = "Deterministic B2B invoice parser (JSON / UBL-Facturae XML / noisy OCR), 3-way PO-GRN reconciliation with 0-100 risk scoring, and a tamper-evident SQLite WAL hash-chained ledger behind a FastAPI dashboard, by KiberLabs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "KiberLabs Engineering" }]
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
