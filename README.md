@@ -6,6 +6,8 @@
 
 Deterministic **accounts-payable control** for B2B teams: parse invoices from **JSON, UBL / Facturae-style XML and noisy OCR text**, run a **3-way match (Invoice ↔ Purchase Order ↔ Goods Receipt)**, score fraud/error risk **0–100** with explicit `PASS` / `REVIEW` / `BLOCKED` verdicts, and keep every decision in a **tamper-evident SQLite ledger** (SHA-256 hash chain). Zero paid LLM SDKs, zero network calls: the same input always gives the same verdict, which is what auditors need.
 
+
+> **Public Evaluation Sandbox & Scope Note:** This repository contains the open reference core and deterministic `pytest` harness operating on synthetic fixtures (`data/sample_*`) under the [MIT License](LICENSE). Production connectors (live anti-bot scrapers, WhatsApp/Telegram cloud webhooks, ERP/SAP & VIES adapters, and multi-tenant deployment manifests) are maintained in **KiberLabs Private Enterprise Repositories** and delivered under client SOW.
 ---
 
 ## Architecture
@@ -88,4 +90,8 @@ Multi-stage build, runs as non-root `appuser`, with an HTTP `/health` check.
 - `2.500` with a single separator and three digits is read as 2500 (EU thousands); send JSON numbers when that is ambiguous.
 - OCR parser expects `SKU  description  qty x unit-price` lines and common English/Spanish labels; the fixtures are synthetic.
 
-MIT · Built by KiberLabs Engineering.
+---
+
+## License
+
+[MIT](LICENSE) — Built by **KiberLabs Engineering** (*AI & Python Automation Studio*).
