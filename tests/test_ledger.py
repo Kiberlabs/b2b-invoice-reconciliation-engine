@@ -1,4 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import sqlite3
+import tempfile
 import threading
 
 import pytest
@@ -82,3 +85,71 @@ def test_concurrent_writers_keep_chain_valid(ledger):
     assert not errors
     rep = ledger.verify_chain_integrity()
     assert rep["ok"] and rep["entries"] == 40
+
+
+def test_iter_entries_and_empty_vat_history(ledger):
+    fill(ledger, n=5)
+    streamed = list(ledger.iter_entries(batch_size=2))
+    assert [r["seq"] for r in streamed] == [1, 2, 3, 4, 5]
+    assert ledger.history("") == []
+
+
+def test_multithread_close_releases_all_handles_for_tempdir_cleanup():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "mt_close.db"
+        ledger = Ledger(db_path)
+        barrier = threading.Barrier(8)
+
+        def worker(tid: int) -> None:
+            barrier.wait(timeout=5.0)
+            ledger.append({**INV, "invoice_number": f"MT-{tid}"}, RES)
+            _ = ledger.history(INV["vendor_vat"])
+            _ = ledger.entries(limit=10)
+            _ = ledger.verify_chain_integrity()
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = [pool.submit(worker, tid) for tid in range(8)]
+            for fut in futs:
+                fut.result()
+
+        rep = ledger.verify_chain_integrity()
+        assert rep["ok"] and rep["entries"] == 8
+
+        ledger.close()
+        ledger.close()  # idempotent
+
+        with pytest.raises(RuntimeError, match="closed"):
+            ledger.append(INV, RES)
+        with pytest.raises(RuntimeError, match="closed"):
+            ledger.history(INV["vendor_vat"])
+        with pytest.raises(RuntimeError, match="closed"):
+            ledger.entries()
+        with pytest.raises(RuntimeError, match="closed"):
+            ledger.verify_chain_integrity()
+
+
+def test_reentrant_transaction_and_rollback(tmp_path):
+    with Ledger(tmp_path / "tx.db") as ledger:
+        with ledger.transaction():
+            _ = ledger.history(INV["vendor_vat"])
+            ledger.append({**INV, "invoice_number": "TX-1"}, RES)
+            with ledger.transaction():
+                ledger.append({**INV, "invoice_number": "TX-2"}, RES)
+        assert ledger.verify_chain_integrity()["entries"] == 2
+
+        with pytest.raises(ValueError, match="boom"):
+            with ledger.transaction():
+                ledger.append({**INV, "invoice_number": "TX-ROLLBACK"}, RES)
+                raise ValueError("boom")
+        rep = ledger.verify_chain_integrity()
+        assert rep["ok"] and rep["entries"] == 2
+
+        with ledger.transaction():
+            ledger.append({**INV, "invoice_number": "TX-OUTER"}, RES)
+            with pytest.raises(ValueError, match="inner"):
+                with ledger.transaction():
+                    ledger.append({**INV, "invoice_number": "TX-INNER-RB"}, RES)
+                    raise ValueError("inner")
+        rep2 = ledger.verify_chain_integrity()
+        assert rep2["ok"] and rep2["entries"] == 3
+        assert [e["invoice_number"] for e in ledger.iter_entries()] == ["TX-1", "TX-2", "TX-OUTER"]

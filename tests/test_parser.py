@@ -1,10 +1,11 @@
 from datetime import date
 from decimal import Decimal
+import random
 
 import pytest
 
 from invoice_engine.parser import (
-    InvoiceParseError, parse_amount, parse_invoice, validate_iban, validate_vat,
+    InvoiceParseError, LineItem, parse_amount, parse_invoice, validate_iban, validate_vat,
 )
 
 UBL = """<?xml version="1.0"?>
@@ -116,3 +117,135 @@ def test_missing_fields_raise():
     for bad in ("", "   ", '{"total": 5}', "Invoice No: X-1", "[1,2]", "{not json"):
         with pytest.raises(InvoiceParseError):
             parse_invoice(bad)
+
+
+@pytest.mark.parametrize("bad_val", [float("inf"), float("-inf"), float("nan"), Decimal("NaN"), Decimal("Infinity"), True])
+def test_parse_amount_rejects_non_finite_and_bool(bad_val):
+    with pytest.raises(InvoiceParseError):
+        parse_amount(bad_val)
+
+
+def test_line_item_rejects_negative_or_non_finite():
+    with pytest.raises(InvoiceParseError):
+        LineItem("CMP-1", "Board", Decimal("-1"), Decimal("10"))
+    with pytest.raises(InvoiceParseError):
+        LineItem("CMP-1", "Board", Decimal("1"), Decimal("-10"))
+    with pytest.raises(InvoiceParseError):
+        LineItem("CMP-1", "Board", Decimal("NaN"), Decimal("10"))
+    with pytest.raises(InvoiceParseError):
+        parse_invoice('{"invoice_number":"N-1","total":"10","lines":[{"sku":"A","quantity":-2,"unit_price":5}]}')
+    with pytest.raises(InvoiceParseError):
+        parse_invoice('{"invoice_number":"N-2","total":"10","lines":123}')
+
+
+@pytest.mark.parametrize(
+    "bad_amt",
+    ["1.2.3", "1000.500", "1000,500", "123.", "123,", "1..2", "1000.250,50", "1.2,3", "1.2,3.4", "01.500"],
+)
+def test_parse_amount_rejects_ambiguous_and_malformed(bad_amt):
+    with pytest.raises(InvoiceParseError):
+        parse_amount(bad_amt)
+    assert parse_amount("1.250") == Decimal("1250")
+    assert parse_amount("0,500") == Decimal("0.500")
+    assert parse_amount("-45,10") == Decimal("-45.10")
+
+
+def test_ocr_vat_id_does_not_overwrite_tax():
+    alone = parse_invoice("Invoice No: O-1\nVAT No: 123456789\nTotal: 100.00 EUR")
+    assert alone.tax == Decimal("0") and alone.total == Decimal("100.00")
+
+    after_vat = parse_invoice(
+        "Invoice No: O-2\nVAT: ESB12345674\nVAT No: 123456789\nVAT No. 987654321\nVAT ID: 123456\n"
+        "Subtotal: 100.00 EUR\nVAT 21%: 21.00 EUR\nTotal: 121.00 EUR"
+    )
+    assert after_vat.vendor_vat == "ESB12345674"
+    assert after_vat.tax == Decimal("21.00")
+
+    numeric_tax_line = parse_invoice("Invoice No: O-3\nVAT: 10000.00\nTotal: 10000.00")
+    assert numeric_tax_line.tax == Decimal("10000.00")
+
+
+def test_negative_amounts_rejected_across_json_xml_and_ocr():
+    neg_json_cases = [
+        '{"invoice_number":"NEG-1","total":"-10.00"}',
+        '{"invoice_number":"NEG-2","subtotal":"-10.00","total":"10.00"}',
+        '{"invoice_number":"NEG-3","subtotal":"10.00","tax":"-1.00","total":"9.00"}',
+        '{"invoice_number":"NEG-4","total":"10.00","lines":[{"sku":"A","quantity":1,"unit_price":10,"line_total":"-10.00"}]}',
+    ]
+    for payload in neg_json_cases:
+        with pytest.raises(InvoiceParseError):
+            parse_invoice(payload)
+
+    neg_ubl = UBL.replace("<cbc:PayableAmount>119.00</cbc:PayableAmount>", "<cbc:PayableAmount>-119.00</cbc:PayableAmount>")
+    with pytest.raises(InvoiceParseError):
+        parse_invoice(neg_ubl)
+
+    neg_ubl_line = UBL.replace(
+        "<cbc:InvoicedQuantity>4</cbc:InvoicedQuantity>",
+        "<cbc:InvoicedQuantity>4</cbc:InvoicedQuantity><cbc:LineExtensionAmount>-100.00</cbc:LineExtensionAmount>",
+    )
+    with pytest.raises(InvoiceParseError):
+        parse_invoice(neg_ubl_line)
+
+    neg_facturae = FACTURAE.replace("<InvoiceTotal>242.00</InvoiceTotal>", "<InvoiceTotal>-242.00</InvoiceTotal>")
+    with pytest.raises(InvoiceParseError):
+        parse_invoice(neg_facturae)
+
+    neg_facturae_line = FACTURAE.replace("<Quantity>2</Quantity>", "<Quantity>2</Quantity><TotalCost>-200.00</TotalCost>")
+    with pytest.raises(InvoiceParseError):
+        parse_invoice(neg_facturae_line)
+
+    for neg_ocr in (
+        "Invoice No: N-1\nTotal: -100.00 EUR",
+        "Invoice No: N-2\nSubtotal: -100.00 EUR\nTotal: 100.00 EUR",
+        "Invoice No: N-3\nSubtotal: 100.00 EUR\nVAT: -21.00 EUR\nTotal: 79.00 EUR",
+    ):
+        with pytest.raises(InvoiceParseError):
+            parse_invoice(neg_ocr)
+
+
+def test_deterministic_seeded_parser_fuzzing():
+    rng = random.Random(20261123)
+    alphabet = list("0123456789.,-+$€£ OolIabc\t\n\x00")
+    for _ in range(250):
+        raw = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14)))
+        try:
+            d = parse_amount(raw)
+        except InvoiceParseError:
+            continue
+        assert isinstance(d, Decimal) and d.is_finite()
+
+    for i in range(150):
+        mode = i % 3
+        if mode == 0:
+            payload = {
+                "invoice_number": rng.choice(["", f"FZ-{i}", "INV-X"]),
+                "currency": rng.choice(["EUR", "USD", "GBP", ""]),
+                "subtotal": rng.choice(["100.00", "-10.00", "1.2.3", "1000.500", "abc", 0]),
+                "tax": rng.choice(["21.00", "-5.00", "0", "NaN"]),
+                "total": rng.choice(["121.00", "-10.00", "0", "1.250,50", "1..2"]),
+                "lines": [
+                    {
+                        "sku": "SKU-1",
+                        "quantity": rng.choice([1, -1, "2", "NaN"]),
+                        "unit_price": rng.choice(["10.00", "-5", "1000.500"]),
+                        "line_total": rng.choice([None, "10.00", "-10.00"]),
+                    }
+                ],
+            }
+        elif mode == 1:
+            amt = rng.choice(["100.00", "-50.00", "1.2.3", "abc"])
+            payload = f"<Invoice><ID>X-{i}</ID><LegalMonetaryTotal><PayableAmount>{amt}</PayableAmount></LegalMonetaryTotal></Invoice>"
+        else:
+            amt = rng.choice(["100.00", "-50.00", "1.2.3", "1000.500"])
+            vat_line = rng.choice(["VAT No: 123456789", "VAT 21%: 21.00 EUR", "VAT: -5.00 EUR"])
+            payload = f"Invoice No: T-{i}\n{vat_line}\nTotal: {amt} EUR"
+
+        try:
+            inv = parse_invoice(payload)
+        except InvoiceParseError:
+            continue
+        assert inv.invoice_number
+        assert inv.total.is_finite() and inv.subtotal.is_finite() and inv.tax.is_finite()
+        assert inv.total >= 0 and inv.subtotal >= 0 and inv.tax >= 0
+        assert all(ln.quantity >= 0 and ln.unit_price >= 0 for ln in inv.lines)

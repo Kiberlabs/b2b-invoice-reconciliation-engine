@@ -24,17 +24,22 @@ PASS, REVIEW, BLOCKED = "PASS", "REVIEW", "BLOCKED"
 
 # code -> (points, critical). Critical codes force BLOCKED regardless of the total score.
 RULES: dict[str, tuple[int, bool]] = {
+    "NEGATIVE_AMOUNT": (70, True),
     "DUPLICATE_INVOICE_NUMBER": (60, True),
     "INVALID_IBAN": (50, True),
     "UNAPPROVED_VENDOR": (45, True),
     "ARITHMETIC_ERROR": (40, False),
+    "CURRENCY_MISMATCH": (35, False),
     "NEAR_DUPLICATE": (35, False),
     "NO_PO": (30, False),
+    "PO_NUMBER_MISMATCH": (30, False),
+    "GRN_PO_MISMATCH": (30, False),
     "VENDOR_PO_MISMATCH": (30, False),
     "QTY_OVER_RECEIVED": (30, False),
     "PRICE_VARIANCE": (25, False),
     "QTY_OVER_PO": (25, False),
     "SKU_NOT_IN_PO": (25, False),
+    "EMPTY_INVOICE_LINES": (25, False),
     "MISSING_GRN": (20, False),
     "LINE_SUM_MISMATCH": (20, False),
     "INVALID_VAT": (15, False),
@@ -47,12 +52,19 @@ class POLine:
     quantity: Decimal
     unit_price: Decimal
 
+    def __post_init__(self) -> None:
+        if not (self.quantity.is_finite() and self.unit_price.is_finite()):
+            raise ValueError("PO line quantity and unit_price must be finite")
+        if self.quantity < 0 or self.unit_price < 0:
+            raise ValueError("PO line quantity and unit_price must be non-negative")
+
 
 @dataclass
 class PurchaseOrder:
     po_number: str
     vendor_vat: str = ""
     lines: list[POLine] = field(default_factory=list)
+    currency: str = ""
 
 
 @dataclass
@@ -61,6 +73,7 @@ class GoodsReceipt:
 
     po_number: str
     received: dict[str, Decimal] = field(default_factory=dict)
+    currency: str = ""
 
 
 @dataclass
@@ -107,6 +120,7 @@ def po_from_dict(d: dict[str, Any]) -> PurchaseOrder:
         po_number=str(d["po_number"]),
         vendor_vat=str(d.get("vendor_vat", "")),
         lines=[POLine(str(ln["sku"]), Decimal(str(ln["quantity"])), Decimal(str(ln["unit_price"]))) for ln in d.get("lines", [])],
+        currency=str(d.get("currency") or "").strip().upper(),
     )
 
 
@@ -115,8 +129,15 @@ def grn_from_dict(d: dict[str, Any]) -> GoodsReceipt:
     received: dict[str, Decimal] = {}
     for ln in d.get("lines", []):
         k = _norm_sku(str(ln["sku"]))
-        received[k] = received.get(k, Decimal("0")) + Decimal(str(ln["quantity"]))
-    return GoodsReceipt(po_number=str(d["po_number"]), received=received)
+        q = Decimal(str(ln["quantity"]))
+        if not q.is_finite() or q < 0:
+            raise ValueError("GRN line quantity must be finite and non-negative")
+        received[k] = received.get(k, Decimal("0")) + q
+    return GoodsReceipt(
+        po_number=str(d["po_number"]),
+        received=received,
+        currency=str(d.get("currency") or "").strip().upper(),
+    )
 
 
 def reconcile(
@@ -144,6 +165,8 @@ def reconcile(
         flag("INVALID_VAT", f"VAT/IVA id '{vat or 'missing'}' has an invalid format")
 
     # --- arithmetic
+    if invoice.total < 0 or invoice.subtotal < 0 or invoice.tax < 0:
+        flag("NEGATIVE_AMOUNT", f"negative invoice amount (subtotal={invoice.subtotal}, tax={invoice.tax}, total={invoice.total})")
     if abs(invoice.subtotal + invoice.tax - invoice.total) > MONEY_TOLERANCE:
         flag("ARITHMETIC_ERROR", f"subtotal {invoice.subtotal} + tax {invoice.tax} != total {invoice.total}")
     if invoice.lines:
@@ -151,46 +174,102 @@ def reconcile(
         if abs(line_sum - invoice.subtotal) > MONEY_TOLERANCE:
             flag("LINE_SUM_MISMATCH", f"line items sum to {line_sum} but subtotal is {invoice.subtotal}")
 
-    # --- duplicates (same vendor only)
-    for h in history:
-        if normalize_id(h.vendor_vat) != vat:
-            continue
-        if h.invoice_number.strip().upper() == invoice.invoice_number.strip().upper():
-            flag("DUPLICATE_INVOICE_NUMBER", f"invoice number {invoice.invoice_number} was already processed for this vendor")
-            break
-    else:
+    # --- currency consistency across legs that specify one
+    inv_cur = (invoice.currency or "").strip().upper()
+    po_cur = (po.currency or "").strip().upper() if po is not None else ""
+    grn_cur = (grn.currency or "").strip().upper() if grn is not None else ""
+    if len({c for c in (inv_cur, po_cur, grn_cur) if c}) > 1:
+        flag("CURRENCY_MISMATCH", f"currency mismatch across documents (invoice={inv_cur or 'unset'}, po={po_cur or 'unset'}, grn={grn_cur or 'unset'})")
+
+    # --- duplicates (same vendor only; empty VAT cannot identify a vendor)
+    if vat:
         for h in history:
-            if (
-                normalize_id(h.vendor_vat) == vat
-                and h.issue_date and invoice.issue_date
-                and abs((h.issue_date - invoice.issue_date).days) <= NEAR_DUP_DAYS
-                and abs(h.total - invoice.total) <= MONEY_TOLERANCE
-            ):
-                flag("NEAR_DUPLICATE", f"same vendor and amount as {h.invoice_number} within {NEAR_DUP_DAYS} days")
+            if normalize_id(h.vendor_vat) != vat:
+                continue
+            if h.invoice_number.strip().upper() == invoice.invoice_number.strip().upper():
+                flag("DUPLICATE_INVOICE_NUMBER", f"invoice number {invoice.invoice_number} was already processed for this vendor")
                 break
+        else:
+            for h in history:
+                if (
+                    normalize_id(h.vendor_vat) == vat
+                    and h.issue_date and invoice.issue_date
+                    and abs((h.issue_date - invoice.issue_date).days) <= NEAR_DUP_DAYS
+                    and abs(h.total - invoice.total) <= MONEY_TOLERANCE
+                ):
+                    flag("NEAR_DUPLICATE", f"same vendor and amount as {h.invoice_number} within {NEAR_DUP_DAYS} days")
+                    break
 
     # --- 3-way match
     if po is None:
         flag("NO_PO", f"no purchase order found for '{invoice.po_number or 'missing reference'}'")
     else:
+        if normalize_id(invoice.po_number) != normalize_id(po.po_number):
+            flag("PO_NUMBER_MISMATCH", f"invoice PO '{invoice.po_number or 'missing'}' does not match PO {po.po_number}")
         if po.vendor_vat and normalize_id(po.vendor_vat) != vat:
             flag("VENDOR_PO_MISMATCH", f"PO {po.po_number} was issued to a different vendor")
-        po_lines = {_norm_sku(ln.sku): ln for ln in po.lines}
+
+        po_qty: dict[str, Decimal] = {}
+        po_prices: dict[str, set[Decimal]] = {}
+        po_cost: dict[str, Decimal] = {}
+        for pl in po.lines:
+            key = _norm_sku(pl.sku)
+            po_qty[key] = po_qty.get(key, Decimal("0")) + pl.quantity
+            po_prices.setdefault(key, set()).add(pl.unit_price)
+            po_cost[key] = po_cost.get(key, Decimal("0")) + pl.quantity * pl.unit_price
+        po_price: dict[str, Decimal] = {
+            key: (next(iter(prices)) if len(prices) == 1 else (po_cost[key] / po_qty[key] if po_qty[key] > 0 else next(iter(prices))))
+            for key, prices in po_prices.items()
+        }
+
+        grn_received: dict[str, Decimal] | None = None
         if grn is None:
             flag("MISSING_GRN", f"no goods receipt recorded for PO {po.po_number}")
+        else:
+            if grn.po_number.strip() and po.po_number.strip() and normalize_id(grn.po_number) != normalize_id(po.po_number):
+                flag("GRN_PO_MISMATCH", f"GRN PO '{grn.po_number}' does not match PO {po.po_number}")
+            grn_received = {}
+            for raw_k, q in grn.received.items():
+                if not q.is_finite() or q < 0:
+                    raise ValueError("GRN received quantity must be finite and non-negative")
+                nk = _norm_sku(raw_k)
+                grn_received[nk] = grn_received.get(nk, Decimal("0")) + q
+
+        if po_qty and not invoice.lines:
+            flag("EMPTY_INVOICE_LINES", f"invoice has no line items for PO {po.po_number}")
+
+        inv_qty: dict[str, Decimal] = {}
+        inv_label: dict[str, str] = {}
+        missing_skus: set[str] = set()
+        price_flagged: set[str] = set()
         for ln in invoice.lines:
             key = _norm_sku(ln.sku)
-            pl = po_lines.get(key)
-            if pl is None:
-                flag("SKU_NOT_IN_PO", f"SKU {ln.sku} is not on PO {po.po_number}")
+            inv_qty[key] = inv_qty.get(key, Decimal("0")) + ln.quantity
+            inv_label.setdefault(key, ln.sku)
+            if key not in po_qty:
+                if key not in missing_skus:
+                    missing_skus.add(key)
+                    flag("SKU_NOT_IN_PO", f"SKU {ln.sku} is not on PO {po.po_number}")
                 continue
-            if pl.unit_price and abs(ln.unit_price - pl.unit_price) / pl.unit_price > PRICE_TOLERANCE:
-                pct = (ln.unit_price - pl.unit_price) / pl.unit_price * 100
-                flag("PRICE_VARIANCE", f"{ln.sku} billed {ln.unit_price} vs PO {pl.unit_price} ({pct:+.1f}%, limit 3%)")
-            if ln.quantity > pl.quantity:
-                flag("QTY_OVER_PO", f"{ln.sku} billed {ln.quantity} but PO allows {pl.quantity}")
-            if grn is not None and ln.quantity > grn.received.get(key, Decimal("0")):
-                flag("QTY_OVER_RECEIVED", f"{ln.sku} billed {ln.quantity} but only {grn.received.get(key, Decimal('0'))} received")
+            if key not in price_flagged:
+                unit_p = po_price[key]
+                if unit_p == 0:
+                    if ln.unit_price != 0:
+                        price_flagged.add(key)
+                        flag("PRICE_VARIANCE", f"{ln.sku} billed {ln.unit_price} vs PO {unit_p} (non-zero on zero-priced PO)")
+                elif abs(ln.unit_price - unit_p) / unit_p > PRICE_TOLERANCE:
+                    price_flagged.add(key)
+                    pct = (ln.unit_price - unit_p) / unit_p * 100
+                    flag("PRICE_VARIANCE", f"{ln.sku} billed {ln.unit_price} vs PO {unit_p} ({pct:+.1f}%, limit 3%)")
+
+        for key, qty in inv_qty.items():
+            if key not in po_qty:
+                continue
+            label = inv_label[key]
+            if qty > po_qty[key]:
+                flag("QTY_OVER_PO", f"{label} billed {qty} across invoice lines but PO allows {po_qty[key]}")
+            if grn_received is not None and qty > grn_received.get(key, Decimal("0")):
+                flag("QTY_OVER_RECEIVED", f"{label} billed {qty} across invoice lines but only {grn_received.get(key, Decimal('0'))} received")
 
     score = min(100, sum(a.points for a in found))
     if any(a.critical for a in found) or score >= BLOCK_SCORE:

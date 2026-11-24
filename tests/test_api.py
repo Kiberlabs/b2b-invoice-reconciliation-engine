@@ -1,6 +1,10 @@
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import io
+from pathlib import Path
 import sqlite3
+import tempfile
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -106,3 +110,177 @@ def test_csv_export_neutralises_formulas(client):
     assert r.headers["content-type"].startswith("text/csv")
     rows = list(csv.DictReader(io.StringIO(r.text)))
     assert rows[0]["invoice_number"] == "'=HYPERLINK(1)" and rows[0]["entry_hash"]
+
+
+def test_approved_vendors_empty_env_is_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("INVOICE_ENGINE_APPROVED_VENDORS", "")
+    c = TestClient(create_app(str(tmp_path / "empty_vendors.db"), KEY))
+    r = post(c, inv("VEND-1"))
+    assert r.status_code == 200
+    body = r.json()["result"]
+    assert body["verdict"] == "BLOCKED"
+    assert any(a["code"] == "UNAPPROVED_VENDOR" for a in body["anomalies"])
+
+
+def test_whitespace_api_key_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("INVOICE_ENGINE_API_KEY", "   ")
+    with pytest.raises(RuntimeError):
+        create_app(str(tmp_path / "ws.db"))
+
+
+@pytest.mark.parametrize(
+    "bad_extra",
+    [
+        {"po": {"po_number": "PO-1", "vendor_vat": "ESB12345674", "lines": [{"sku": "CMP-1", "quantity": -1, "unit_price": "25.00"}]}},
+        {"po": {"po_number": "PO-1", "vendor_vat": "ESB12345674", "lines": [{"sku": "CMP-1", "quantity": "NaN", "unit_price": "25.00"}]}},
+        {"grn": {"po_number": "PO-1", "lines": [{"sku": "CMP-1", "quantity": -2}]}},
+        {"grn": {"po_number": "PO-1", "lines": [{"sku": "CMP-1", "quantity": "Infinity"}]}},
+    ],
+)
+def test_bad_po_grn_negative_or_nan_returns_422(client, bad_extra):
+    payload = {"invoice": inv("BAD-POGRN"), **bad_extra}
+    r = client.post("/v1/reconcile", headers=H, json=payload)
+    assert r.status_code == 422
+
+
+def test_export_csv_exceeds_5000_rows(tmp_path):
+    app = create_app(str(tmp_path / "big_export.db"), KEY)
+    ledger = app.state.ledger
+    inv_row = {
+        "invoice_number": "INV-BULK",
+        "vendor_vat": "ESB12345674",
+        "vendor_name": "Northwind",
+        "issue_date": "2026-11-20",
+        "currency": "EUR",
+        "total": "302.50",
+    }
+    res_row = {"verdict": "PASS", "risk_score": 0, "anomalies": []}
+    with ledger._use() as db:
+        # Insert 5050 hash-valid rows in a single transaction for fast streaming test
+        from invoice_engine.ledger import GENESIS_HASH, _entry_hash
+        prev = GENESIS_HASH
+        db.execute("BEGIN IMMEDIATE")
+        for seq in range(1, 5051):
+            row = {
+                "seq": seq,
+                "ts": "2026-11-20T00:00:00+00:00",
+                "invoice_number": f"BULK-{seq}",
+                "vendor_vat": inv_row["vendor_vat"],
+                "vendor_name": inv_row["vendor_name"],
+                "issue_date": inv_row["issue_date"],
+                "currency": inv_row["currency"],
+                "total": inv_row["total"],
+                "verdict": res_row["verdict"],
+                "risk_score": res_row["risk_score"],
+                "anomalies": "[]",
+            }
+            row["prev_hash"] = prev
+            row["entry_hash"] = _entry_hash(prev, row)
+            prev = row["entry_hash"]
+            db.execute(
+                "INSERT INTO audit_entries (seq, ts, invoice_number, vendor_vat, vendor_name, issue_date, currency, total, verdict, risk_score, anomalies, prev_hash, entry_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [row[k] for k in ("seq", "ts", "invoice_number", "vendor_vat", "vendor_name", "issue_date", "currency", "total", "verdict", "risk_score", "anomalies", "prev_hash", "entry_hash")],
+            )
+        db.execute("COMMIT")
+
+    c = TestClient(app)
+    r = c.get("/v1/export.csv", headers=H)
+    assert r.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(r.text)))
+    assert len(rows) == 5050
+    assert rows[0]["seq"] == "1" and rows[-1]["seq"] == "5050"
+    assert rows[-1]["invoice_number"] == "BULK-5050"
+
+
+def test_csv_export_sanitizes_currency_and_whitespace_newline_formulas(client):
+    def vendor_named(name: str) -> dict:
+        return {"name": name, "vat": "ESB12345674", "iban": "ES9121000418450200051332"}
+
+    payloads = [
+        inv("CSV-1", currency="=HYPERLINK(1)", vendor=vendor_named(" =1+1")),
+        inv("CSV-2", vendor=vendor_named("\n=2+2")),
+        inv("CSV-3", vendor=vendor_named("\r+3+3")),
+        inv("CSV-4", vendor=vendor_named("Acme\n=4+4")),
+    ]
+    for p in payloads:
+        assert post(client, p).status_code == 200
+
+    r = client.get("/v1/export.csv", headers=H)
+    assert r.status_code == 200
+    rows = {row["invoice_number"]: row for row in csv.DictReader(io.StringIO(r.text))}
+    assert rows["CSV-1"]["currency"] == "'=HYPERLINK(1)"
+    assert rows["CSV-1"]["vendor_name"] == "' =1+1"
+    assert rows["CSV-2"]["vendor_name"] == "' =2+2"
+    assert rows["CSV-3"]["vendor_name"] == "' +3+3"
+    assert rows["CSV-4"]["vendor_name"] == "Acme =4+4"
+
+
+def test_reconcile_negative_json_or_xml_returns_422(client):
+    assert post(client, inv("NEG-JSON", total="-302.50")).status_code == 422
+    neg_xml = "<Invoice><ID>NEG-XML</ID><LegalMonetaryTotal><PayableAmount>-100.00</PayableAmount></LegalMonetaryTotal></Invoice>"
+    assert post(client, neg_xml, format="xml").status_code == 422
+
+
+def test_concurrent_duplicate_race_is_atomic_and_cleans_up():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = create_app(str(Path(tmp) / "race.db"), KEY)
+        c = TestClient(app)
+        barrier = threading.Barrier(8)
+
+        def fire(_: int) -> dict:
+            barrier.wait(timeout=5.0)
+            resp = post(c, inv("RACE-DUP-1"))
+            assert resp.status_code == 200
+            return resp.json()
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(fire, range(8)))
+
+            verdicts = [r["result"]["verdict"] for r in results]
+            assert verdicts.count("PASS") == 1
+            assert verdicts.count("BLOCKED") == 7
+            blocked_codes = [
+                {a["code"] for a in r["result"]["anomalies"]}
+                for r in results
+                if r["result"]["verdict"] == "BLOCKED"
+            ]
+            assert all("DUPLICATE_INVOICE_NUMBER" in cset for cset in blocked_codes)
+
+            verify = c.get("/v1/ledger/verify", headers=H).json()
+            assert verify["ok"] is True and verify["entries"] == 8
+        finally:
+            app.state.ledger.close()
+
+
+def test_concurrent_near_duplicate_race_is_atomic_and_cleans_up():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = create_app(str(Path(tmp) / "near_race.db"), KEY)
+        c = TestClient(app)
+        barrier = threading.Barrier(4)
+
+        def fire(idx: int) -> dict:
+            barrier.wait(timeout=5.0)
+            resp = post(c, inv(f"ND-{idx}", issue_date=f"2026-11-{18 + idx:02d}"))
+            assert resp.status_code == 200
+            return resp.json()
+
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(fire, range(4)))
+
+            verdicts = [r["result"]["verdict"] for r in results]
+            assert verdicts.count("PASS") == 1
+            assert verdicts.count("REVIEW") == 3
+            review_codes = [
+                {a["code"] for a in r["result"]["anomalies"]}
+                for r in results
+                if r["result"]["verdict"] == "REVIEW"
+            ]
+            assert all("NEAR_DUPLICATE" in cset for cset in review_codes)
+
+            verify = c.get("/v1/ledger/verify", headers=H).json()
+            assert verify["ok"] is True and verify["entries"] == 4
+        finally:
+            app.state.ledger.close()

@@ -86,8 +86,13 @@ def parse_amount(raw: Any) -> Decimal:
     three digits is a thousands mark (``1.250`` -> 1250) unless the integer part is ``0``.
     shortcut: ``2.500`` in a US document reads as 2500, pass JSON numbers when that matters.
     """
+    if isinstance(raw, bool):
+        raise InvoiceParseError(f"unparseable amount: {raw!r}")
     if isinstance(raw, (int, float, Decimal)):
-        return Decimal(str(raw))
+        d = raw if isinstance(raw, Decimal) else Decimal(str(raw))
+        if not d.is_finite():
+            raise InvoiceParseError(f"non-finite amount: {raw!r}")
+        return d
     s = _CUR_TOKEN.sub("", str(raw)).strip()
     s = re.sub(r"[\s\u00a0']", "", s)
     if re.fullmatch(r"-?[\dOolI.,]+", s) and re.search(r"\d", s):
@@ -95,22 +100,41 @@ def parse_amount(raw: Any) -> Decimal:
     if not re.fullmatch(r"-?\d[\d.,]*", s):
         raise InvoiceParseError(f"unparseable amount: {raw!r}")
     dot, comma = s.rfind("."), s.rfind(",")
-    dec: str | None = None
     if dot >= 0 and comma >= 0:
         dec = "." if dot > comma else ","
+        tsep = "," if dec == "." else "."
+        if s.count(dec) != 1:
+            raise InvoiceParseError(f"unparseable amount: {raw!r}")
+        int_part, frac_part = s.split(dec)
+        if not re.fullmatch(r"\d+", frac_part) or not re.fullmatch(
+            r"-?[1-9]\d{0,2}(?:" + re.escape(tsep) + r"\d{3})+", int_part
+        ):
+            raise InvoiceParseError(f"unparseable amount: {raw!r}")
+        s = int_part.replace(tsep, "") + "." + frac_part
     elif dot >= 0 or comma >= 0:
         sep = "." if dot >= 0 else ","
         parts = s.split(sep)
-        thousands = len(parts) > 2 or (len(parts[-1]) == 3 and parts[0].lstrip("-") != "0")
-        dec = None if thousands else sep
-    if dec is None:
-        s = s.replace(".", "").replace(",", "")
-    else:
-        s = s.replace("," if dec == "." else ".", "").replace(dec, ".")
+        if len(parts) > 2:
+            if not re.fullmatch(r"-?[1-9]\d{0,2}(?:" + re.escape(sep) + r"\d{3})+", s):
+                raise InvoiceParseError(f"unparseable amount: {raw!r}")
+            s = s.replace(sep, "")
+        else:
+            head, tail = parts[0].lstrip("-"), parts[1]
+            if not tail:
+                raise InvoiceParseError(f"unparseable amount: {raw!r}")
+            if len(tail) == 3 and head != "0":
+                if not (1 <= len(head) <= 3 and not head.startswith("0")):
+                    raise InvoiceParseError(f"unparseable amount: {raw!r}")
+                s = s.replace(sep, "")
+            else:
+                s = s.replace(sep, ".")
     try:
-        return Decimal(s)
+        d = Decimal(s)
     except InvalidOperation as exc:  # pragma: no cover - guarded by the regexes above
         raise InvoiceParseError(f"unparseable amount: {raw!r}") from exc
+    if not d.is_finite():
+        raise InvoiceParseError(f"non-finite amount: {raw!r}")
+    return d
 
 
 def parse_date(raw: Any) -> date | None:
@@ -141,6 +165,12 @@ class LineItem:
     quantity: Decimal
     unit_price: Decimal
 
+    def __post_init__(self) -> None:
+        if not (self.quantity.is_finite() and self.unit_price.is_finite()):
+            raise InvoiceParseError("line item quantity and unit_price must be finite")
+        if self.quantity < 0 or self.unit_price < 0:
+            raise InvoiceParseError("line item quantity and unit_price must be non-negative")
+
     @property
     def line_total(self) -> Decimal:
         return self.quantity * self.unit_price
@@ -163,6 +193,10 @@ class Invoice:
     total: Decimal = Decimal("0")
     source_format: str = "json"
     warnings: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not (self.subtotal.is_finite() and self.tax.is_finite() and self.total.is_finite()):
+            raise InvoiceParseError("invoice subtotal, tax and total must be finite")
 
     @property
     def vat_valid(self) -> bool:
@@ -200,6 +234,8 @@ def _finish(inv: Invoice) -> Invoice:
     """Fill derived subtotal, then enforce the two mandatory fields."""
     if not inv.invoice_number:
         raise InvoiceParseError("missing invoice number")
+    if inv.total < 0 or inv.subtotal < 0 or inv.tax < 0:
+        raise InvoiceParseError("invoice amounts must be non-negative")
     if inv.total == 0 and inv.subtotal == 0:
         raise InvoiceParseError("missing total")
     if inv.subtotal == 0 and inv.lines:
@@ -219,21 +255,31 @@ def _pick(d: dict[str, Any], *keys: str, default: Any = "") -> Any:
 
 
 def _money(v: Any) -> Decimal:
-    return parse_amount(v) if v not in (None, "") else Decimal("0")
+    d = parse_amount(v) if v not in (None, "") else Decimal("0")
+    if d < 0:
+        raise InvoiceParseError(f"negative amount not allowed: {v!r}")
+    return d
 
 
 def _from_json(data: dict[str, Any]) -> Invoice:
     vendor = data.get("vendor") if isinstance(data.get("vendor"), dict) else {}
-    lines = [
-        LineItem(
-            sku=str(_pick(ln, "sku", "code", "item_id")),
-            description=str(_pick(ln, "description", "name")),
-            quantity=_money(_pick(ln, "quantity", "qty", default="0")),
-            unit_price=_money(_pick(ln, "unit_price", "price", default="0")),
+    raw_lines = data.get("lines", data.get("items", []))
+    if not isinstance(raw_lines, list):
+        raise InvoiceParseError("invoice lines must be a list")
+    lines = []
+    for ln in raw_lines:
+        if not isinstance(ln, dict):
+            continue
+        if ln.get("line_total") not in (None, ""):
+            _money(ln["line_total"])
+        lines.append(
+            LineItem(
+                sku=str(_pick(ln, "sku", "code", "item_id")),
+                description=str(_pick(ln, "description", "name")),
+                quantity=_money(_pick(ln, "quantity", "qty", default="0")),
+                unit_price=_money(_pick(ln, "unit_price", "price", default="0")),
+            )
         )
-        for ln in data.get("lines", data.get("items", []))
-        if isinstance(ln, dict)
-    ]
     return _finish(
         Invoice(
             invoice_number=str(_pick(data, "invoice_number", "number", "invoice_no", "id")).strip(),
@@ -295,6 +341,8 @@ def _from_ubl(root: ET.Element) -> Invoice:
     for e in root.iter():
         if _ln(e) != "InvoiceLine":
             continue
+        if lt := _tx(e, "LineExtensionAmount", "TotalCost", "GrossAmount"):
+            _money(lt)
         item = _el(e, "Item")
         lines.append(
             LineItem(
@@ -328,16 +376,20 @@ def _from_facturae(root: ET.Element) -> Invoice:
     vat = _tx(seller, "TaxIdentificationNumber")
     if vat and not vat[:2].isalpha():
         vat = "ES" + vat  # Facturae omits the country prefix for Spanish taxpayers
-    lines = [
-        LineItem(
-            sku=_tx(e, "ArticleCode"),
-            description=_tx(e, "ItemDescription"),
-            quantity=_money(_tx(e, "Quantity")),
-            unit_price=_money(_tx(e, "UnitPriceWithoutTax")),
+    lines = []
+    for e in root.iter():
+        if _ln(e) != "InvoiceLine":
+            continue
+        if lt := _tx(e, "LineExtensionAmount", "TotalCost", "GrossAmount"):
+            _money(lt)
+        lines.append(
+            LineItem(
+                sku=_tx(e, "ArticleCode"),
+                description=_tx(e, "ItemDescription"),
+                quantity=_money(_tx(e, "Quantity")),
+                unit_price=_money(_tx(e, "UnitPriceWithoutTax")),
+            )
         )
-        for e in root.iter()
-        if _ln(e) == "InvoiceLine"
-    ]
     return _finish(
         Invoice(
             invoice_number=_tx(root, "InvoiceNumber"),
@@ -373,7 +425,12 @@ _TEXT_FIELDS: dict[str, re.Pattern[str]] = {
 }
 _VAT_ID = re.compile(r"^\s*(?:vat(?:\s*(?:id|no\.?|number|reg\.?))?|iva\s*(?:id|no)|tax\s*id|nif|cif)\s*[:#]\s*(?P<v>[A-Za-z0-9 .\-]{8,20}?)\s*$", re.I)
 _SUBTOTAL = re.compile(r"^\s*(?:sub\s*-?\s*tota[l1]|net(?:\s*amount)?|base\s*imponible|importe\s*neto)\b[^\d\n-]*" + _AMT, re.I)
-_TAX = re.compile(r"^\s*(?:tota[l1]\s+)?(?:vat|iva|tax|impuestos?)\b[^:\n]*?(?::|\s)\s*" + _CUR + _AMT, re.I)
+_TAX = re.compile(
+    r"^\s*(?:tota[l1]\s+)?(?:vat|iva|tax|impuestos?)\b(?![^:\n]*(?:\b(?:id|no|nr|num|number|reg|registration|code|ref)\b|\bn[º°]))[^:\n]*?(?::|\s)\s*"
+    + _CUR
+    + _AMT,
+    re.I,
+)
 _TOTAL = re.compile(r"^\s*(?:grand\s*)?tota[l1]\b(?:\s*(?:due|amount|a\s*pagar|factura))?[^\d\n-]*" + _AMT, re.I)
 _LINE = re.compile(
     r"^\s*(?P<sku>[A-Z][A-Z0-9]*-[A-Z0-9\-]+)\s+(?P<desc>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s*[x×*]\s*(?P<price>\S+)", re.I

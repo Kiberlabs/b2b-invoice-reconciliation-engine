@@ -14,10 +14,10 @@ import io
 import os
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
@@ -32,7 +32,8 @@ DEFAULT_APPROVED_VENDORS = ("ESB12345674", "DE123456789")
 
 _CSV_COLUMNS = ["seq", "ts", "invoice_number", "vendor_vat", "vendor_name", "issue_date", "currency", "total",
                 "verdict", "risk_score", "anomaly_codes", "prev_hash", "entry_hash"]
-_CSV_TEXT = {"invoice_number", "vendor_vat", "vendor_name"}
+_CSV_TEXT = {"invoice_number", "vendor_vat", "vendor_name", "currency"}
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t")
 _CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'"
 
 
@@ -47,20 +48,22 @@ class ReconcileRequest(BaseModel):
 
 def _csv_safe(value: Any) -> str:
     """Neutralise spreadsheet formula injection in free-text cells."""
-    s = str(value)
-    return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+    s = str(value).replace("\r", " ").replace("\n", " ")
+    if s[:1] in _CSV_FORMULA_PREFIXES or s.lstrip()[:1] in _CSV_FORMULA_PREFIXES:
+        return "'" + s
+    return s
 
 
 def create_app(db_path: str | None = None, api_key: str | None = None, approved_vendors: list[str] | None = None) -> FastAPI:
     """Application factory; refuses to start without an API key (no insecure default)."""
-    key = api_key or os.environ.get("INVOICE_ENGINE_API_KEY", "")
+    key = (api_key if api_key is not None else os.environ.get("INVOICE_ENGINE_API_KEY", "")).strip()
     if not key:
         raise RuntimeError("INVOICE_ENGINE_API_KEY is required")
     key_digest = hashlib.sha256(key.encode()).digest()
     if approved_vendors is None:
         env = os.environ.get("INVOICE_ENGINE_APPROVED_VENDORS")
-        approved_vendors = [v for v in env.split(",") if v.strip()] if env else list(DEFAULT_APPROVED_VENDORS)
-    ledger = Ledger(db_path or os.environ.get("INVOICE_ENGINE_DB", "data/ledger.db"))
+        approved_vendors = [v.strip() for v in env.split(",") if v.strip()] if env is not None else list(DEFAULT_APPROVED_VENDORS)
+    ledger = Ledger(db_path or os.environ.get("INVOICE_ENGINE_DB") or "data/ledger.db")
 
     app = FastAPI(title="KiberLabs Invoice Reconciliation Engine", version=__version__)
     header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -84,12 +87,13 @@ def create_app(db_path: str | None = None, api_key: str | None = None, approved_
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise HTTPException(status_code=422, detail=f"invalid po/grn payload: {exc!r}") from exc
         inv_dict = inv.to_dict()
-        history = [
-            HistoryEntry(h["invoice_number"], h["vendor_vat"], parse_date(h["issue_date"]), Decimal(h["total"]))
-            for h in ledger.history(inv_dict["vendor_vat"])
-        ]
-        result = reconcile(inv, po, grn, approved_vendors, history).to_dict()
-        entry = ledger.append(inv_dict, result)
+        with ledger.transaction():
+            history = [
+                HistoryEntry(h["invoice_number"], h["vendor_vat"], parse_date(h["issue_date"]), Decimal(h["total"]))
+                for h in ledger.history(inv_dict["vendor_vat"])
+            ]
+            result = reconcile(inv, po, grn, approved_vendors, history).to_dict()
+            entry = ledger.append(inv_dict, result)
         return {"invoice": inv_dict, "result": result, "ledger": {"seq": entry["seq"], "entry_hash": entry["entry_hash"]}}
 
     @v1.get("/ledger")
@@ -103,16 +107,27 @@ def create_app(db_path: str | None = None, api_key: str | None = None, approved_
         return ledger.verify_chain_integrity()
 
     @v1.get("/export.csv")
-    def export_csv() -> PlainTextResponse:
-        """Full audit export (formula-injection safe)."""
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(_CSV_COLUMNS)
-        for e in reversed(ledger.entries(5000)):
-            e["anomaly_codes"] = " ".join(a["code"] for a in e["anomalies"])
-            w.writerow([_csv_safe(e[c]) if c in _CSV_TEXT else e[c] for c in _CSV_COLUMNS])
-        return PlainTextResponse(buf.getvalue(), media_type="text/csv",
-                                 headers={"Content-Disposition": 'attachment; filename="invoice_audit_export.csv"'})
+    def export_csv() -> StreamingResponse:
+        """Full audit export (formula-injection safe, streamed without row limit)."""
+        def _stream() -> Iterator[str]:
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(_CSV_COLUMNS)
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            for e in ledger.iter_entries():
+                e["anomaly_codes"] = " ".join(a["code"] for a in e["anomalies"])
+                w.writerow([_csv_safe(e[c]) if c in _CSV_TEXT else e[c] for c in _CSV_COLUMNS])
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate(0)
+
+        return StreamingResponse(
+            _stream(),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="invoice_audit_export.csv"'},
+        )
 
     app.include_router(v1)
 

@@ -54,6 +54,9 @@ class Ledger:
 
     def __init__(self, path: str | Path):
         self.path = str(path)
+        self._lock = threading.RLock()
+        self._conns: set[sqlite3.Connection] = set()
+        self._closed = False
         self._local = threading.local()
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._use() as db:
@@ -62,27 +65,78 @@ class Ledger:
     @contextmanager
     def _use(self) -> Iterator[sqlite3.Connection]:
         """Yield this thread's connection, creating it with the WAL pragmas on first use."""
-        db = getattr(self._local, "db", None)
-        if db is None:
-            db = sqlite3.connect(self.path, timeout=5, isolation_level=None)  # autocommit; we manage BEGIN IMMEDIATE
-            db.row_factory = sqlite3.Row
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA busy_timeout=5000")
-            db.execute("PRAGMA synchronous=NORMAL")
-            self._local.db = db
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Ledger is closed")
+            db = getattr(self._local, "db", None)
+            if db is None or db not in self._conns:
+                db = sqlite3.connect(self.path, timeout=5, isolation_level=None, check_same_thread=False)  # autocommit; one conn per thread, closable from any thread
+                try:
+                    db.row_factory = sqlite3.Row
+                    db.execute("PRAGMA journal_mode=WAL")
+                    db.execute("PRAGMA busy_timeout=5000")
+                    db.execute("PRAGMA synchronous=NORMAL")
+                except BaseException:
+                    db.close()
+                    raise
+                self._local.db = db
+                self._conns.add(db)
         yield db
 
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Reentrant write transaction: outer uses BEGIN IMMEDIATE, nested uses SAVEPOINT."""
+        with self._lock:
+            with self._use() as db:
+                depth = getattr(self._local, "tx_depth", 0)
+                use_savepoint = depth > 0 or db.in_transaction
+                sp = f"sp_{depth}"
+                if use_savepoint:
+                    db.execute(f"SAVEPOINT {sp}")
+                else:
+                    db.execute("BEGIN IMMEDIATE")
+                self._local.tx_depth = depth + 1
+                try:
+                    yield
+                except BaseException:
+                    if use_savepoint:
+                        db.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                        db.execute(f"RELEASE SAVEPOINT {sp}")
+                    elif db.in_transaction:
+                        db.execute("ROLLBACK")
+                    raise
+                else:
+                    if use_savepoint:
+                        db.execute(f"RELEASE SAVEPOINT {sp}")
+                    elif db.in_transaction:
+                        db.execute("COMMIT")
+                finally:
+                    self._local.tx_depth = depth
+
     def close(self) -> None:
-        """Close the calling thread's connection (other threads keep theirs)."""
-        if (db := getattr(self._local, "db", None)) is not None:
-            db.close()
+        """Close all tracked per-thread connections and mark the ledger closed (idempotent)."""
+        with self._lock:
+            self._closed = True
+            conns = list(self._conns)
+            self._conns.clear()
             self._local.db = None
+            self._local.tx_depth = 0
+            for db in conns:
+                try:
+                    db.close()
+                except sqlite3.Error:
+                    pass
+
+    def __enter__(self) -> Ledger:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def append(self, invoice: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
         """Record one reconciliation outcome; returns the stored row including its ``entry_hash``."""
-        with self._use() as db:
-            db.execute("BEGIN IMMEDIATE")
-            try:
+        with self.transaction():
+            with self._use() as db:
                 last = db.execute("SELECT seq, entry_hash FROM audit_entries ORDER BY seq DESC LIMIT 1").fetchall()
                 seq, prev = (last[0]["seq"] + 1, last[0]["entry_hash"]) if last else (1, GENESIS_HASH)
                 row = {
@@ -107,10 +161,6 @@ class Ledger:
                     "INSERT INTO audit_fts (rowid, invoice_number, vendor_name, verdict, anomalies) VALUES (?,?,?,?,?)",
                     (seq, row["invoice_number"], row["vendor_name"], row["verdict"], codes),
                 )
-                db.execute("COMMIT")
-            except BaseException:
-                db.execute("ROLLBACK")
-                raise
         return row
 
     def entries(self, limit: int = 200, query: str | None = None) -> list[dict[str, Any]]:
@@ -133,8 +183,28 @@ class Ledger:
             out.append(d)
         return out
 
+    def iter_entries(self, batch_size: int = 1000) -> Iterator[dict[str, Any]]:
+        """Stream all entries in ascending ``seq`` order without a row-count cap."""
+        step = max(1, int(batch_size))
+        last_seq = 0
+        while True:
+            with self._use() as db:
+                rows = db.execute(
+                    "SELECT * FROM audit_entries WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+                    (last_seq, step),
+                ).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                d = dict(r)
+                d["anomalies"] = json.loads(d["anomalies"])
+                last_seq = int(d["seq"])
+                yield d
+
     def history(self, vendor_vat: str) -> list[dict[str, Any]]:
         """Prior invoices for one vendor (used by the duplicate rules)."""
+        if not vendor_vat:
+            return []
         with self._use() as db:
             rows = db.execute(
                 "SELECT invoice_number, vendor_vat, issue_date, total FROM audit_entries WHERE vendor_vat = ?", (vendor_vat,)
