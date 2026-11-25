@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import sqlite3
 import threading
+import time
+import weakref
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +52,25 @@ def _entry_hash(prev_hash: str, row: dict[str, Any]) -> str:
     return hashlib.sha256(f"{prev_hash}|{body}".encode()).hexdigest()
 
 
+_SQLITE_OPEN_MAX_ATTEMPTS = 6
+
+
+def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _close_tracked_conns(conns: set[sqlite3.Connection], lock: threading.RLock) -> None:
+    with lock:
+        to_close = list(conns)
+        conns.clear()
+    for db in to_close:
+        try:
+            db.close()
+        except sqlite3.Error:
+            pass
+
+
 class Ledger:
     """Append-only, hash-chained audit log. One cached connection per thread (reopening WAL per call costs ~1s on Windows)."""
 
@@ -58,9 +80,47 @@ class Ledger:
         self._conns: set[sqlite3.Connection] = set()
         self._closed = False
         self._local = threading.local()
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._use() as db:
-            db.executescript(_SCHEMA)
+        self._finalizer = weakref.finalize(self, _close_tracked_conns, self._conns, self._lock)
+        if self.path != ":memory:":
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        db = self._open_connection(init_schema=True)
+        with self._lock:
+            self._local.db = db
+            self._conns.add(db)
+
+    def _open_connection(self, init_schema: bool = False) -> sqlite3.Connection:
+        for attempt in range(_SQLITE_OPEN_MAX_ATTEMPTS):
+            db: sqlite3.Connection | None = None
+            try:
+                db = sqlite3.connect(self.path, timeout=5.0, isolation_level=None, check_same_thread=False)  # autocommit; one conn per thread, closable from any thread
+                db.row_factory = sqlite3.Row
+                db.execute("PRAGMA busy_timeout=5000")
+                mode_row = db.execute("PRAGMA journal_mode").fetchone()
+                mode = str(mode_row[0]).lower() if mode_row else ""
+                if mode not in ("wal", "memory"):
+                    db.execute("PRAGMA journal_mode=WAL")
+                db.execute("PRAGMA synchronous=NORMAL")
+                if init_schema:
+                    db.executescript(_SCHEMA)
+                return db
+            except sqlite3.OperationalError as exc:
+                if db is not None:
+                    try:
+                        db.close()
+                    except sqlite3.Error:
+                        pass
+                if _is_transient_sqlite_error(exc) and attempt < _SQLITE_OPEN_MAX_ATTEMPTS - 1:
+                    time.sleep(min(0.2, 0.02 * (2 ** attempt)) + random.uniform(0.0, 0.02))
+                    continue
+                raise
+            except BaseException:
+                if db is not None:
+                    try:
+                        db.close()
+                    except sqlite3.Error:
+                        pass
+                raise
+        raise sqlite3.OperationalError("database is locked")
 
     @contextmanager
     def _use(self) -> Iterator[sqlite3.Connection]:
@@ -70,15 +130,7 @@ class Ledger:
                 raise RuntimeError("Ledger is closed")
             db = getattr(self._local, "db", None)
             if db is None or db not in self._conns:
-                db = sqlite3.connect(self.path, timeout=5, isolation_level=None, check_same_thread=False)  # autocommit; one conn per thread, closable from any thread
-                try:
-                    db.row_factory = sqlite3.Row
-                    db.execute("PRAGMA journal_mode=WAL")
-                    db.execute("PRAGMA busy_timeout=5000")
-                    db.execute("PRAGMA synchronous=NORMAL")
-                except BaseException:
-                    db.close()
-                    raise
+                db = self._open_connection(init_schema=False)
                 self._local.db = db
                 self._conns.add(db)
         yield db
@@ -126,6 +178,7 @@ class Ledger:
                     db.close()
                 except sqlite3.Error:
                     pass
+        self._finalizer.detach()
 
     def __enter__(self) -> Ledger:
         return self
