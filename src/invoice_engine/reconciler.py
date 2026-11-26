@@ -11,9 +11,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
+import re
 from typing import Any, Iterable
+import unicodedata
 
 from .parser import Invoice, normalize_id
+
+_ZW_RE = re.compile(r"[\u200b-\u200d\u2060\ufeff]")
+
+
+def _norm_inv_num(value: str) -> str:
+    return unicodedata.normalize("NFKC", _ZW_RE.sub("", value)).strip().upper()
 
 PRICE_TOLERANCE = Decimal("0.03")  # variance above 3% vs PO is flagged
 MONEY_TOLERANCE = Decimal("0.01")
@@ -186,7 +194,7 @@ def reconcile(
         for h in history:
             if normalize_id(h.vendor_vat) != vat:
                 continue
-            if h.invoice_number.strip().upper() == invoice.invoice_number.strip().upper():
+            if _norm_inv_num(h.invoice_number) == _norm_inv_num(invoice.invoice_number):
                 flag("DUPLICATE_INVOICE_NUMBER", f"invoice number {invoice.invoice_number} was already processed for this vendor")
                 break
         else:

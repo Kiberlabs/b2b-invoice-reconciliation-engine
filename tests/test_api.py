@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from concurrent.futures import ThreadPoolExecutor
 import csv
 import io
@@ -284,3 +286,77 @@ def test_concurrent_near_duplicate_race_is_atomic_and_cleans_up():
             assert verify["ok"] is True and verify["entries"] == 4
         finally:
             app.state.ledger.close()
+
+
+def test_csv_export_all_six_formula_prefixes(client):
+    payloads = [
+        inv("CSV-EQ", vendor={"name": "=1+1", "vat": "ESB12345674", "iban": "ES9121000418450200051332"}),
+        inv("CSV-PL", vendor={"name": "+1+1", "vat": "ESB12345674", "iban": "ES9121000418450200051332"}),
+        inv("CSV-MN", vendor={"name": "-1+1", "vat": "ESB12345674", "iban": "ES9121000418450200051332"}),
+        inv("CSV-AT", vendor={"name": "@SUM(1,1)", "vat": "ESB12345674", "iban": "ES9121000418450200051332"}),
+        inv("CSV-TB", vendor={"name": "\t=1+1", "vat": "ESB12345674", "iban": "ES9121000418450200051332"}),
+        inv("CSV-CR", vendor={"name": "\r=1+1", "vat": "ESB12345674", "iban": "ES9121000418450200051332"}),
+    ]
+    for p in payloads:
+        assert post(client, p).status_code == 200
+
+    r = client.get("/v1/export.csv", headers=H)
+    assert r.status_code == 200
+    rows = {row["invoice_number"]: row for row in csv.DictReader(io.StringIO(r.text))}
+    assert rows["CSV-EQ"]["vendor_name"] == "'=1+1"
+    assert rows["CSV-PL"]["vendor_name"] == "'+1+1"
+    assert rows["CSV-MN"]["vendor_name"] == "'-1+1"
+    assert rows["CSV-AT"]["vendor_name"] == "'@SUM(1,1)"
+    assert rows["CSV-TB"]["vendor_name"] == "'\t=1+1"
+    assert rows["CSV-CR"]["vendor_name"] == "' =1+1"
+
+
+def test_unicode_homoglyph_zero_width_and_nfd_nfkc_boundaries(client):
+    first = post(client, inv("INV-UNI-1")).json()
+    assert first["result"]["verdict"] == "PASS"
+
+    # Zero-width and fullwidth NFKC duplicate invoice_number variants must still trigger DUPLICATE_INVOICE_NUMBER.
+    for variant in ("INV\u200b-UNI-1", "ＩＮＶ－ＵＮＩ－１"):
+        dup = post(client, inv(variant)).json()
+        assert dup["result"]["verdict"] == "BLOCKED"
+        assert any(a["code"] == "DUPLICATE_INVOICE_NUMBER" for a in dup["result"]["anomalies"])
+
+    # Cyrillic homoglyph VAT/IBAN ('Е' U+0415) must fail closed as INVALID_IBAN + UNAPPROVED_VENDOR.
+    homoglyph_inv = inv("INV-HOMO-1")
+    homoglyph_inv["vendor"]["vat"] = "\u0415SB12345674"
+    homoglyph_inv["vendor"]["iban"] = "\u0415S9121000418450200051332"
+    homo_res = post(client, homoglyph_inv).json()["result"]
+    assert homo_res["verdict"] == "BLOCKED"
+    homo_codes = {a["code"] for a in homo_res["anomalies"]}
+    assert {"INVALID_IBAN", "UNAPPROVED_VENDOR"} <= homo_codes
+
+    # NFD/NFKC/zero-width FTS5 queries must not raise 500s.
+    for q in ("e\u0301clair", "ＰＡＳＳ", "INV\u200b-UNI-1"):
+        assert client.get("/v1/ledger", headers=H, params={"q": q}).status_code == 200
+
+
+def test_api_lifespan_closes_ledger_for_tempdir_cleanup():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        with TestClient(create_app(str(tmp_dir / "lifespan.db"), KEY)) as c:
+            assert post(c, inv("LIFE-1")).status_code == 200
+            assert c.get("/v1/ledger/verify", headers=H).json()["ok"] is True
+    assert not tmp_dir.exists()
+
+
+def test_csv_export_neutralises_unicode_format_and_nfkc_formulas(client):
+    vectors = [
+        ("CSV-BOM", "\ufeff=1+1"),
+        ("CSV-ZWSP", "\u200b=1+1"),
+        ("CSV-FW", "\uff1d1+1"),
+        ("CSV-SHY", "\u00ad=1+1"),
+    ]
+    for inv_no, vendor_name in vectors:
+        payload = inv(inv_no, vendor={"name": vendor_name, "vat": "ESB12345674", "iban": "ES9121000418450200051332"})
+        assert post(client, payload).status_code == 200
+
+    r = client.get("/v1/export.csv", headers=H)
+    assert r.status_code == 200
+    rows = {row["invoice_number"]: row for row in csv.DictReader(io.StringIO(r.text))}
+    for inv_no, vendor_name in vectors:
+        assert rows[inv_no]["vendor_name"] == "'" + vendor_name

@@ -12,6 +12,9 @@ import hashlib
 import hmac
 import io
 import os
+import unicodedata
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterator, Literal
@@ -49,7 +52,10 @@ class ReconcileRequest(BaseModel):
 def _csv_safe(value: Any) -> str:
     """Neutralise spreadsheet formula injection in free-text cells."""
     s = str(value).replace("\r", " ").replace("\n", " ")
-    if s[:1] in _CSV_FORMULA_PREFIXES or s.lstrip()[:1] in _CSV_FORMULA_PREFIXES:
+    stripped = "".join(
+        ch for ch in unicodedata.normalize("NFKC", s) if unicodedata.category(ch) != "Cf"
+    ).lstrip()
+    if s[:1] in _CSV_FORMULA_PREFIXES or stripped[:1] in _CSV_FORMULA_PREFIXES:
         return "'" + s
     return s
 
@@ -65,7 +71,14 @@ def create_app(db_path: str | None = None, api_key: str | None = None, approved_
         approved_vendors = [v.strip() for v in env.split(",") if v.strip()] if env is not None else list(DEFAULT_APPROVED_VENDORS)
     ledger = Ledger(db_path or os.environ.get("INVOICE_ENGINE_DB") or "data/ledger.db")
 
-    app = FastAPI(title="KiberLabs Invoice Reconciliation Engine", version=__version__)
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            ledger.close()
+
+    app = FastAPI(title="KiberLabs Invoice Reconciliation Engine", version=__version__, lifespan=lifespan)
     header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
     def require_key(provided: str | None = Depends(header)) -> None:

@@ -19,7 +19,8 @@ RES = {"verdict": "REVIEW", "risk_score": 40, "anomalies": [{"code": "ARITHMETIC
 
 @pytest.fixture
 def ledger(tmp_path):
-    return Ledger(tmp_path / "l.db")
+    with Ledger(tmp_path / "l.db") as l:
+        yield l
 
 
 def fill(ledger, n=3):
@@ -359,5 +360,31 @@ def test_ledger_cold_start_retry_and_tempdir_cleanup(monkeypatch: pytest.MonkeyP
             Ledger(db_path)
         assert len(conns) == 1
         assert conns[0].closed
+
+    assert not tmp_dir.exists()
+
+
+def test_ledger_16_thread_wal_stress_and_win_cleanup() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        db_path = tmp_dir / "wal_16t.db"
+        with Ledger(db_path) as ledger:
+            barrier = threading.Barrier(16)
+
+            def worker(tid: int) -> None:
+                barrier.wait(timeout=10.0)
+                ledger.append({**INV, "invoice_number": f"T16-{tid}-A"}, RES)
+                _ = ledger.history(INV["vendor_vat"])
+                _ = ledger.entries(limit=10, query="T16")
+                ledger.append({**INV, "invoice_number": f"T16-{tid}-B"}, RES)
+
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                futs = [pool.submit(worker, tid) for tid in range(16)]
+                for fut in futs:
+                    fut.result()
+
+            rep = ledger.verify_chain_integrity()
+            assert rep["ok"] is True
+            assert rep["entries"] == 32
 
     assert not tmp_dir.exists()

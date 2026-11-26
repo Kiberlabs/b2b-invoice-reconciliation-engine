@@ -4,6 +4,8 @@ Flow: the page asks for the API key, then calls /v1/ledger, /v1/ledger/verify, /
 Every server-provided value is written with ``textContent`` (never ``innerHTML``) so ledger data cannot inject script.
 """
 
+from __future__ import annotations
+
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>KiberLabs · Invoice Reconciliation</title>
